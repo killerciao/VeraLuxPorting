@@ -10,8 +10,8 @@
    <!-- Update Package Configuration -->
    <platform os="all" arch="noarch" version="1.8.9:1.9.9">
       <!-- CHANGED 'date' TO 'releaseDate' BELOW -->
-      <package fileName="VeraLux-Porting-V1.0.0.zip" sha1="17d7aba8d20a1d172c6d092c94a997b0cf54ed28" type="script" releaseDate="20251208">
-         <title>VeraLux HyperMetric Stretch v1.0.0</title>
+      <package fileName="VeraLux-Porting-V1.0.5.zip" sha1="bf4877dac52fffae6c06d0306bdec1fe9cf99fd7" type="script" releaseDate="20251208">
+         <title>VeraLux HyperMetric Stretch v1.0.5</title>
          <description>
             <p>
                Initial release of VeraLux porting for PixInsight.<br/>

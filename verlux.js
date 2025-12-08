@@ -1,4 +1,4 @@
-#feature-id    Utilities > VeraLux HyperMetric Stretch
+#feature-id    Killerciao's Scripts > VeraLux HyperMetric Stretch
 #feature-info  Physics-based photometric hyperbolic stretch engine.<br/>\
                <br/>\
                Preserves color ratios while maximizing dynamic range.<br/>\
@@ -9,8 +9,9 @@
                • Background extracted<br/>\
                • Color calibrated (for RGB)<br/>\
                <br/>\
-               Version 1.2.0
+               Version 1.0.5
 
+#feature-icon  verlux-icon.svg
 #include <pjsr/Sizer.jsh>
 #include <pjsr/FrameStyle.jsh>
 #include <pjsr/TextAlign.jsh>
@@ -431,7 +432,7 @@ function VeraLuxDialog() {
    this.__base__ = Dialog;
    this.__base__();
    
-   var VERSION = "1.2.0";
+   var VERSION = "1.2.1";
    
    var headerStyle = "font-size: 14pt; font-weight: bold; color: #4aa3df;";
    var subHeaderStyle = "font-size: 10pt; color: #4aa3df;";
@@ -636,15 +637,18 @@ function VeraLuxDialog() {
    this.btnProcess = new PushButton(this);
    this.btnProcess.text = "PROCESS";
    this.btnProcess.defaultButton = true;
-   this.btnProcess.backgroundColor = 0x285299;
+   // CHANGED COLOR TO GREEN (ARGB Format: Alpha=FF, R=00, G=99, B=00)
+   this.btnProcess.backgroundColor = 0xFF009900; 
    this.btnProcess.textColor = 0xFFFFFF;
    this.btnProcess.toolTip = "Execute the Stretch";
    
    this.btnProcess.onClick = function() {
+      // CHECK FOR IMAGE IMMEDIATELY
       if (!ImageWindow.activeWindow) {
-         (new MessageBox("No active image!", "Error", StdIcon_Error, StdButton_Ok)).execute();
+         (new MessageBox("Please load an image first before clicking Process.", "No Active Image", StdIcon_Error, StdButton_Ok)).execute();
          return;
       }
+
       dlg.btnProcess.enabled = false;
       dlg.btnReset.enabled = false;
       dlg.btnAuto.enabled = false;
@@ -756,7 +760,10 @@ function VeraLuxDialog() {
    };
 
    this.runAutoSolver = function() {
-      if (!ImageWindow.activeWindow) return;
+      if (!ImageWindow.activeWindow) {
+          (new MessageBox("Please load an image first for the Auto Solver.", "No Active Image", StdIcon_Error, StdButton_Ok)).execute();
+          return;
+      }
       var img = ImageWindow.activeWindow.mainView.image;
       var weights = SENSOR_PROFILES[p_sensorProfile].weights;
       var isRGB = img.numberOfChannels === 3;
