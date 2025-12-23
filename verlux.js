@@ -1,37 +1,35 @@
 /*
- * VeraLux — HyperMetric Stretch
- * Photometric Hyperbolic Stretch Engine for PixInsight
+ * VeraLux Suite v2.0.7 (Safe Star Levels)
+ * Unified Photometric Engine for PixInsight
+ *
+ * Contains:
+ * 1. HyperMetric Stretch (Physics-based IHS)
+ * 2. StarComposer (Star Reconstruction & Composition)
  *
  * Based on the original Python implementation by Riccardo Paterniti
+ * Ported to PixInsight JavaScript Runtime (PJSR)
+ *
  * Copyright (c) 2025 Riccardo Paterniti
  * Contact: info@veralux.space
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * Ported to PixInsight JavaScript Runtime (PJSR)
  */
 
-#feature-id    VHS-Porting > VeraLux HyperMetric Stretch
-#feature-info  Physics-based photometric hyperbolic stretch engine.<br/>\
+#feature-id    VeraLux > VeraLux Suite
+#feature-info  <b>VeraLux Suite v2.0.7</b><br/>\
+               A unified photometric engine for deep-sky processing.<br/>\
                <br/>\
-               Preserves color ratios while maximizing dynamic range.<br/>\
-               Sensor-aware luminance extraction with QE weighting.<br/>\
-               Includes Hybrid Color Grip engine.<br/>\
+               <b>Module 1: HyperMetric Stretch</b><br/>\
+               Physics-based linear-to-nonlinear stretch engine.<br/>\
+               • <b>Input:</b> Any LINEAR image (Stars or Starless).<br/>\
+               • <b>Smart Fixer:</b> Prevents black clipping via iterative analysis.<br/>\
+               • <b>Unified Strategy:</b> Single slider for Noise vs Highlight balance.<br/>\
                <br/>\
-               <b>Requirements:</b><br/>\
-               • Linear image (not stretched)<br/>\
-               • Background extracted<br/>\
-               • Color calibrated (SPCC/PCC)<br/>\
+               <b>Module 2: StarComposer</b><br/>\
+               High-fidelity star reconstruction and composition.<br/>\
+               • <b>Input:</b> Linear Starmask + Stretched Starless Base.<br/>\
+               • <b>Auto-Star:</b> Smart solver targeting non-destructive visibility.<br/>\
+               • <b>Vector Preservation:</b> Zero hue shift star stretching.<br/>\
                <br/>\
-               Based on the original Python implementation by Riccardo Paterniti
+               Input Requirement: <b>Linear, Color Calibrated (SPCC), Denoised data.</b>
 
 #feature-icon  verlux-icon.svg
 
@@ -43,7 +41,15 @@
 #include <pjsr/NumericControl.jsh>
 #include <pjsr/SampleType.jsh>
 #include <pjsr/ColorSpace.jsh>
+#include <pjsr/DataType.jsh>
+#include <pjsr/ImageOp.jsh>
+#include <pjsr/MorphOp.jsh>
 
+var VERSION = "2.0.7";
+
+// =============================================================================
+//  SENSOR DATABASE
+// =============================================================================
 var SENSOR_PROFILES = {
    "Rec.709 (Recommended)": {
       weights: [0.2126, 0.7152, 0.0722],
@@ -110,11 +116,6 @@ var SENSOR_PROFILES = {
       description: "Canon CMOS Profile (Modern)",
       info: "Balanced profile for most Canon EOS cameras."
    },
-   "Canon EOS (Legacy - 300D/40D)": {
-      weights: [0.2400, 0.5400, 0.2200],
-      description: "Canon CMOS Profile (Legacy)",
-      info: "For older Canon models (Digic 2/3 era)."
-   },
    "Nikon DSLR (Modern - D5300/D850)": {
       weights: [0.2600, 0.5100, 0.2300],
       description: "Nikon CMOS Profile (Modern)",
@@ -130,74 +131,127 @@ var SENSOR_PROFILES = {
       description: "ZWO Seestar S30",
       info: "Specific profile for Seestar S30 smart telescope."
    },
+   "Dual Band (OSC)": {
+      weights: [0.3333, 0.3333, 0.3333],
+      description: "Dual Band Filters (L-Extreme/Ultimate)",
+      info: "Uniform weighting. Prevents OIII background noise from tinting the image Teal."
+   },
    "Narrowband HOO": {
-      weights: [0.5000, 0.2500, 0.2500],
+      weights: [0.3333, 0.3333, 0.3333],
       description: "Bicolor palette: Hα=Red, OIII=Green+Blue",
-      info: "Balanced weighting for HOO synthetic palette processing."
+      info: "Uniform weighting. Stabilizes background vectors for synthetic palettes."
    },
    "Narrowband SHO": {
-      weights: [0.3333, 0.3400, 0.3267],
+      weights: [0.3333, 0.3333, 0.3333],
       description: "Hubble palette: SII=Red, Hα=Green, OIII=Blue",
-      info: "Nearly uniform weighting for SHO tricolor narrowband."
+      info: "Uniform weighting. Ensures equal contribution from S/H/O."
    }
 };
 
 var DEFAULT_PROFILE = "Rec.709 (Recommended)";
 
 // =============================================================================
-//  CORE ENGINE (Single Source of Truth)
+//  CORE ENGINE (Math & Statistics)
 // =============================================================================
 
 function VeraLuxCore() {}
 
 VeraLuxCore.percentile = function(arr, p) {
-   // Basic implementation for unsorted arrays
-   var sorted = arr.slice().sort(function(a, b) { return a - b; });
-   var idx = (p / 100.0) * (sorted.length - 1);
+   if (arr.length === 0) return 0;
+   arr.sort(function(a, b) { return a - b; });
+   var idx = (p / 100.0) * (arr.length - 1);
    var lower = Math.floor(idx);
    var upper = Math.ceil(idx);
    var weight = idx - lower;
-   
-   if (upper >= sorted.length) return sorted[sorted.length - 1];
-   return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+   if (upper >= arr.length) return arr[arr.length - 1];
+   return arr[lower] * (1 - weight) + arr[upper] * weight;
 };
 
-VeraLuxCore.calculateAnchor = function(img, isRGB) {
-   var w = img.width;
-   var h = img.height;
+// Statistical Anchor (Fallback)
+VeraLuxCore.calculateAnchorStats = function(img, isRGB) {
+   var w = img.width; var h = img.height;
    var totalPixels = w * h;
-   // Subsample for speed
    var step = Math.max(1, Math.floor(totalPixels / 500000));
-   
    if (isRGB) {
       var floors = [];
       for (var c = 0; c < 3; c++) {
          var channelSamples = [];
          for (var i = 0; i < totalPixels; i += step) {
-            var y = Math.floor(i / w);
-            var x = i % w;
+            var y = Math.floor(i / w); var x = i % w;
             channelSamples.push(img.sample(x, y, c));
          }
          floors.push(this.percentile(channelSamples, 0.5));
       }
-      var minFloor = Math.min.apply(null, floors);
-      return Math.max(0.0, minFloor - 0.00025);
+      return Math.max(0.0, Math.min.apply(null, floors) - 0.00025);
    } else {
       var samples = [];
       for (var i = 0; i < totalPixels; i += step) {
-         var y = Math.floor(i / w);
-         var x = i % w;
+         var y = Math.floor(i / w); var x = i % w;
          samples.push(img.sample(x, y, 0));
       }
-      var floor = this.percentile(samples, 0.5);
-      return Math.max(0.0, floor - 0.00025);
+      return Math.max(0.0, this.percentile(samples, 0.5) - 0.00025);
    }
 };
 
+// Adaptive Anchor (Histogram Analysis)
+VeraLuxCore.calculateAnchorAdaptive = function(img, weights) {
+   var w = img.width; var h = img.height;
+   var totalPixels = w * h;
+   var isRGB = (img.numberOfChannels === 3);
+   var step = Math.max(1, Math.floor(totalPixels / 2000000)); // Sample heavily
+   var samples = [];
+   
+   for (var i = 0; i < totalPixels; i += step) {
+      var y = Math.floor(i / w); var x = i % w;
+      if (isRGB) {
+         samples.push(weights[0]*img.sample(x,y,0) + weights[1]*img.sample(x,y,1) + weights[2]*img.sample(x,y,2));
+      } else {
+         samples.push(img.sample(x,y,0));
+      }
+   }
+   
+   var numBins = 65536; 
+   var hist = new Array(numBins); for(var z=0;z<numBins;++z) hist[z]=0;
+   var maxVal = 0;
+   
+   for (var j = 0; j < samples.length; j++) {
+      var bin = Math.floor(samples[j] * (numBins - 1));
+      if(bin >= 0 && bin < numBins) { 
+          hist[bin]++; 
+          if(hist[bin] > maxVal) maxVal = hist[bin]; 
+      }
+   }
+   
+   // Smoothing
+   var smoothed = new Array(numBins); for(var z=0;z<numBins;++z) smoothed[z]=0;
+   var windowSize = 50;
+   for (var k = 0; k < numBins; k++) {
+      var sum = 0; var count = 0;
+      for (var win = -windowSize; win <= windowSize; win++) {
+         if (k+win >= 0 && k+win < numBins) { sum += hist[k+win]; count++; }
+      }
+      smoothed[k] = sum / count;
+   }
+   
+   // Find Peak
+   var peakIdx = 0; var peakVal = 0;
+   for (var k = 100; k < numBins; k++) { 
+       if (smoothed[k] > peakVal) { peakVal = smoothed[k]; peakIdx = k; } 
+   }
+   
+   // Walk back to 6% of peak
+   var targetVal = peakVal * 0.06; var anchorIdx = 0;
+   for (var k = peakIdx; k >= 0; k--) { 
+       if (smoothed[k] < targetVal) { anchorIdx = k; break; } 
+   }
+   
+   var anchor = anchorIdx / (numBins - 1);
+   if (anchor <= 0.0 || isNaN(anchor)) anchor = this.percentile(samples, 0.5);
+   return Math.max(0.0, anchor);
+};
+
 VeraLuxCore.hyperbolicStretch = function(value, D, b, SP) {
-   D = Math.max(D, 0.1);
-   b = Math.max(b, 0.1);
-   SP = SP || 0.0;
+   D = Math.max(D, 0.1); b = Math.max(b, 0.1); SP = SP || 0.0;
    var term1 = Math.asinh(D * (value - SP) + b);
    var term2 = Math.asinh(b);
    var norm = Math.asinh(D * (1.0 - SP) + b) - term2;
@@ -206,255 +260,169 @@ VeraLuxCore.hyperbolicStretch = function(value, D, b, SP) {
 };
 
 VeraLuxCore.applyMTF = function(value, m) {
-   if (value <= 0) return 0;
-   if (value >= 1) return 1;
+   if (value <= 0) return 0; if (value >= 1) return 1;
    var term1 = (m - 1.0) * value;
    var term2 = (2.0 * m - 1.0) * value - m;
    if (Math.abs(term2) < 1e-9) return value;
-   var result = term1 / term2;
-   return Math.max(0.0, Math.min(1.0, result));
+   return Math.max(0.0, Math.min(1.0, term1 / term2));
 };
 
+// Binary search for LogD
 VeraLuxCore.solveLogD = function(medianIn, targetMedian, bVal) {
    if (medianIn < 1e-9) return 2.0;
-   var lowLog = 0.0;
-   var highLog = 7.0;
-   var bestLogD = 2.0;
-   var epsilon = 0.0001;
-   
-   // Binary search
+   var lowLog = 0.0; var highLog = 7.0; var bestLogD = 2.0;
    for (var iter = 0; iter < 40; iter++) {
       var midLog = (lowLog + highLog) / 2.0;
       var midD = Math.pow(10.0, midLog);
       var testVal = this.hyperbolicStretch(medianIn, midD, bVal, 0.0);
-      if (Math.abs(testVal - targetMedian) < epsilon) {
-         bestLogD = midLog;
-         break;
-      }
-      if (testVal < targetMedian) {
-         lowLog = midLog;
-      } else {
-         highLog = midLog;
-      }
+      if (Math.abs(testVal - targetMedian) < 0.0001) { bestLogD = midLog; break; }
+      if (testVal < targetMedian) lowLog = midLog;
+      else highLog = midLog;
    }
    return bestLogD;
 };
 
 // =============================================================================
-//  MAIN PROCESSING ENGINE
+//  HELPER FUNCTIONS (Surgery & Math)
 // =============================================================================
 
-function processVeraLux(img, params, progressCallback) {
-   if (progressCallback) progressCallback("Analyzing image data...", 0);
-   
-   var w = img.width;
-   var h = img.height;
-   var nc = img.numberOfChannels;
-   var isRGB = (nc === 3);
-   
-   var weights = params.weights;
-   var logD = params.logD;
-   var protectB = params.protectB;
-   var convergence = params.convergence;
-   var processingMode = params.processingMode;
-   var targetBg = params.targetBg;
-   var colorGrip = params.colorGrip !== undefined ? params.colorGrip : 1.0;
-   
-   // 1. Calculate Anchor
-   if (progressCallback) progressCallback("Calculating black point...", 5);
-   var anchor = VeraLuxCore.calculateAnchor(img, isRGB);
-   
-   var result = new Image(w, h, nc, isRGB ? ColorSpace_RGB : ColorSpace_Gray, 32, SampleType_Real);
-   
-   if (progressCallback) progressCallback("Starting Stretch...", 10);
-   
-   var epsilon = 1e-9;
-   var lastPct = 0;
-   var D_val = Math.pow(10, logD);
-   var pedestal = 0.005; // Safety pedestal matching Python v1.2.2
-
-   // Pre-calc constants
-   var oneMinusGrip = 1.0 - colorGrip;
-
-   for (var y = 0; y < h; y++) {
-      var pct = 10 + Math.round((y / h) * 80);
-      if (pct !== lastPct) {
-         if (progressCallback) progressCallback("Stretching: " + Math.round((y/h)*100) + "%", pct);
-         lastPct = pct;
-         processEvents();
+function createGaussianKernel(size, sigma) {
+   var kernel = new Matrix(size, size);
+   var center = (size - 1) / 2;
+   var sum = 0;
+   for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+         var dist = Math.sqrt((x - center) * (x - center) + (y - center) * (y - center));
+         var val = Math.exp(-(dist * dist) / (2 * sigma * sigma));
+         kernel.at(y, x, val);
+         sum += val;
       }
+   }
+   // Normalize
+   for (var i = 0; i < size * size; i++) kernel.at(i, kernel.at(i) / sum);
+   return kernel;
+}
 
-      for (var x = 0; x < w; x++) {
-         if (isRGB) {
-            // Anchor subtraction
-            var r = Math.max(0, img.sample(x, y, 0) - anchor);
-            var g = Math.max(0, img.sample(x, y, 1) - anchor);
-            var b = Math.max(0, img.sample(x, y, 2) - anchor);
-            
-            // Extract Luminance
-            var L = weights[0] * r + weights[1] * g + weights[2] * b;
-            var Lsafe = L + epsilon;
-            
-            // Vector Ratios
-            var rRatio = r / Lsafe;
-            var gRatio = g / Lsafe;
-            var bRatio = b / Lsafe;
-            
-            // Hyperbolic Stretch
-            var Lstr = VeraLuxCore.hyperbolicStretch(L, D_val, protectB, 0);
-            Lstr = Math.max(0, Math.min(1, Lstr));
-            
-            // Convergence
-            var k = Math.pow(Lstr, convergence);
-            
-            // --- VECTOR PATH (Scientific) ---
-            var rVec = Lstr * (rRatio * (1.0 - k) + k);
-            var gVec = Lstr * (gRatio * (1.0 - k) + k);
-            var bVec = Lstr * (bRatio * (1.0 - k) + k);
-            
-            var rFinal = rVec;
-            var gFinal = gVec;
-            var bFinal = bVec;
+function applyOpticalHealing(img, strength) {
+   if (strength <= 0) return img;
+   var workImg = new Image(img);
+   // Convert to Lab to isolate chroma
+   workImg.convert(ColorSpace_Lab);
+   
+   var kSize = Math.floor(strength * 2) + 1;
+   if (kSize % 2 == 0) kSize++;
+   var sigma = (kSize / 2.0) * 0.3 + 0.8; 
+   var kernel = createGaussianKernel(kSize, sigma);
+   
+   // Blur a and b channels
+   workImg.convolve(kernel, 1); 
+   workImg.convolve(kernel, 2); 
+   
+   workImg.convert(ColorSpace_RGB);
+   return workImg;
+}
 
-            // --- HYBRID PATH (Color Grip) ---
-            // If colorGrip < 1.0, blend with scalar stretch
-            if (colorGrip < 1.0) {
-               var rScal = VeraLuxCore.hyperbolicStretch(r, D_val, protectB, 0);
-               var gScal = VeraLuxCore.hyperbolicStretch(g, D_val, protectB, 0);
-               var bScal = VeraLuxCore.hyperbolicStretch(b, D_val, protectB, 0);
-               
-               // Clip scalars
-               rScal = Math.max(0, Math.min(1, rScal));
-               gScal = Math.max(0, Math.min(1, gScal));
-               bScal = Math.max(0, Math.min(1, bScal));
-
-               rFinal = rVec * colorGrip + rScal * oneMinusGrip;
-               gFinal = gVec * colorGrip + gScal * oneMinusGrip;
-               bFinal = bVec * colorGrip + bScal * oneMinusGrip;
-            }
-            
-            // Apply Pedestal and Clip
-            result.setSample(Math.max(0, Math.min(1, rFinal * (1.0 - pedestal) + pedestal)), x, y, 0);
-            result.setSample(Math.max(0, Math.min(1, gFinal * (1.0 - pedestal) + pedestal)), x, y, 1);
-            result.setSample(Math.max(0, Math.min(1, bFinal * (1.0 - pedestal) + pedestal)), x, y, 2);
-
-         } else {
-            // Mono
-            var val = Math.max(0, img.sample(x, y, 0) - anchor);
-            var str = VeraLuxCore.hyperbolicStretch(val, D_val, protectB, 0);
-            result.setSample(Math.max(0, Math.min(1, str * (1.0 - pedestal) + pedestal)), x, y, 0);
+function applyStarReduction(img, intensity) {
+   if (intensity <= 0) return img;
+   var kSize = (intensity < 0.5) ? 3 : 5;
+   var strElem = new Matrix(kSize, kSize);
+   var center = Math.floor(kSize/2);
+   for(var y=0; y<kSize; y++) {
+      for(var x=0; x<kSize; x++) {
+         if( Math.sqrt(Math.pow(x-center,2) + Math.pow(y-center,2)) <= center ) strElem.at(y,x, 1);
+         else strElem.at(y,x, 0);
+      }
+   }
+   var eroded = new Image(img);
+   eroded.morphology(MorphOp_Erosion, strElem);
+   
+   // Blend: result = img * (1-intensity) + eroded * intensity
+   var result = new Image(img);
+   var w = img.width; var h = img.height; var nc = img.numberOfChannels;
+   
+   for(var c=0; c<nc; c++) {
+      for(var y=0; y<h; y++) {
+         for(var x=0; x<w; x++) {
+             var orig = img.sample(x, y, c);
+             var ero = eroded.sample(x, y, c);
+             result.setSample(orig * (1.0 - intensity) + ero * intensity, x, y, c);
          }
       }
    }
+   return result;
+}
+
+function applyLSR(img, intensity) {
+   if (intensity <= 0) return img;
+   var kSizeVal = Math.floor(Math.min(img.height, img.width) / 15.0);
+   if (kSizeVal % 2 == 0) kSizeVal++;
+   if (kSizeVal < 3) kSizeVal = 3; if (kSizeVal > 127) kSizeVal = 127; 
+   var sigma = (kSizeVal / 2.0) * 0.3 + 0.8;
+   var kernel = createGaussianKernel(kSizeVal, sigma);
    
-   if (processingMode === "ready_to_use") {
-      if (progressCallback) progressCallback("Adaptive Scaling...", 92);
-      result = applyAdaptiveScaling(result, weights, targetBg, null);
-      
-      if (progressCallback) progressCallback("Soft-clip Polish...", 96);
-      result = applySoftClip(result, 0.98, 2.0);
-   }
+   var lowPass = new Image(img);
+   lowPass.convolve(kernel);
    
-   if (progressCallback) progressCallback("Complete!", 100);
+   var highPass = new Image(img);
+   highPass.apply(lowPass, ImageOp_Sub); // Img - LowPass
+   highPass.truncate(0, 1);
+   
+   var result = new Image(img);
+   // result = img*(1-int) + highPass*int
+   // Using rescale/add for speed
+   result.rescale(1.0 - intensity);
+   highPass.rescale(intensity);
+   result.apply(highPass, ImageOp_Add);
    
    return result;
 }
 
-function applyAdaptiveScaling(img, weights, targetBg, progressCallback) {
-   var w = img.width;
-   var h = img.height;
-   var totalPixels = w * h;
-   var nc = img.numberOfChannels;
-   var isRGB = (nc === 3);
+function applyAdaptiveScaling(img, weights, targetBg) {
+   var w = img.width; var h = img.height; var totalPixels = w * h;
+   var nc = img.numberOfChannels; var isRGB = (nc === 3);
    var step = Math.max(1, Math.floor(totalPixels / 500000));
    
    var lumaSamples = [];
-   // Re-scan for stats
    for (var i = 0; i < totalPixels; i += step) {
-      var y = Math.floor(i / w);
-      var x = i % w;
-      if (isRGB) {
-         var L = weights[0] * img.sample(x, y, 0) +
-                 weights[1] * img.sample(x, y, 1) +
-                 weights[2] * img.sample(x, y, 2);
-         lumaSamples.push(L);
-      } else {
-         lumaSamples.push(img.sample(x, y, 0));
-      }
+      var y = Math.floor(i / w); var x = i % w;
+      if (isRGB) lumaSamples.push(weights[0]*img.sample(x,y,0) + weights[1]*img.sample(x,y,1) + weights[2]*img.sample(x,y,2));
+      else lumaSamples.push(img.sample(x,y,0));
    }
    
    var median = VeraLuxCore.percentile(lumaSamples, 50);
-   var stdDev = 0;
-   for (var i = 0; i < lumaSamples.length; i++) {
-      stdDev += Math.pow(lumaSamples[i] - median, 2);
-   }
+   var mean = 0; for(var k=0; k<lumaSamples.length; k++) mean += lumaSamples[k]; mean /= lumaSamples.length;
+   var stdDev = 0; for(var k=0; k<lumaSamples.length; k++) stdDev += Math.pow(lumaSamples[k] - mean, 2); 
    stdDev = Math.sqrt(stdDev / lumaSamples.length);
+   var minVal = 1.0; for(var i=0; i<lumaSamples.length; i++) { if(lumaSamples[i] < minVal) minVal = lumaSamples[i]; }
    
-   var minVal = 1.0;
-   for(var i = 0; i < lumaSamples.length; i++) {
-      if(lumaSamples[i] < minVal) minVal = lumaSamples[i];
-   }
-   
+   // Floor Logic: 2.7 stdDev to properly align with black point
    var globalFloor = Math.max(minVal, median - 2.7 * stdDev);
-   var softCeil, hardCeil;
    
-   if (isRGB) {
-      var r99 = [], g99 = [], b99 = [];
-      var r9999 = [], g9999 = [], b9999 = [];
-      for (var i = 0; i < totalPixels; i += step) {
-         var y = Math.floor(i / w);
-         var x = i % w;
-         var r = img.sample(x, y, 0);
-         var g = img.sample(x, y, 1);
-         var b = img.sample(x, y, 2);
-         r99.push(r); g99.push(g); b99.push(b);
-         r9999.push(r); g9999.push(g); b9999.push(b);
-      }
-      softCeil = Math.max(VeraLuxCore.percentile(r99, 99), VeraLuxCore.percentile(g99, 99), VeraLuxCore.percentile(b99, 99));
-      hardCeil = Math.max(VeraLuxCore.percentile(r9999, 99.99), VeraLuxCore.percentile(g9999, 99.99), VeraLuxCore.percentile(b9999, 99.99));
-   } else {
-      softCeil = VeraLuxCore.percentile(lumaSamples, 99);
-      hardCeil = VeraLuxCore.percentile(lumaSamples, 99.99);
-   }
-   
+   var softCeil = VeraLuxCore.percentile(lumaSamples, 99);
+   var hardCeil = VeraLuxCore.percentile(lumaSamples, 99.99);
    if (softCeil <= globalFloor) softCeil = globalFloor + 1e-6;
    if (hardCeil <= softCeil) hardCeil = softCeil + 1e-6;
    
    var PEDESTAL = 0.001;
-   var TARGET_SOFT = 0.98;
-   var TARGET_HARD = 1.0;
-
-   var scaleContrast = (TARGET_SOFT - PEDESTAL) / (softCeil - globalFloor + 1e-9);
-   var scaleSafety = (TARGET_HARD - PEDESTAL) / (hardCeil - globalFloor + 1e-9);
-   var finalScale = Math.min(scaleContrast, scaleSafety);
+   var finalScale = Math.min((0.98 - PEDESTAL) / (softCeil - globalFloor + 1e-9), (1.0 - PEDESTAL) / (hardCeil - globalFloor + 1e-9));
    
    var result = new Image(w, h, nc, isRGB ? ColorSpace_RGB : ColorSpace_Gray, 32, SampleType_Real);
-   
-   // Apply Expansion
    for (var c = 0; c < nc; c++) {
       for (var y = 0; y < h; y++) {
          for (var x = 0; x < w; x++) {
             var val = img.sample(x, y, c);
             var expanded = (val - globalFloor) * finalScale + PEDESTAL;
-            expanded = Math.max(0, Math.min(1, expanded));
-            result.setSample(expanded, x, y, c);
+            result.setSample(Math.max(0, Math.min(1, expanded)), x, y, c);
          }
       }
    }
    
-   // Apply MTF to match Target BG
+   // Recalculate background after expansion to apply MTF shift
    lumaSamples = [];
    for (var i = 0; i < totalPixels; i += step) {
-      var y = Math.floor(i / w);
-      var x = i % w;
-      if (isRGB) {
-         var L = weights[0] * result.sample(x, y, 0) +
-                 weights[1] * result.sample(x, y, 1) +
-                 weights[2] * result.sample(x, y, 2);
-         lumaSamples.push(L);
-      } else {
-         lumaSamples.push(result.sample(x, y, 0));
-      }
+      var y = Math.floor(i / w); var x = i % w;
+      if (isRGB) lumaSamples.push(weights[0]*result.sample(x,y,0) + weights[1]*result.sample(x,y,1) + weights[2]*result.sample(x,y,2));
+      else lumaSamples.push(result.sample(x,y,0));
    }
    
    var currentBg = VeraLuxCore.percentile(lumaSamples, 50);
@@ -463,8 +431,7 @@ function applyAdaptiveScaling(img, weights, targetBg, progressCallback) {
       for (var c = 0; c < nc; c++) {
          for (var y = 0; y < h; y++) {
             for (var x = 0; x < w; x++) {
-               var val = result.sample(x, y, c);
-               result.setSample(VeraLuxCore.applyMTF(val, m), x, y, c);
+               result.setSample(VeraLuxCore.applyMTF(result.sample(x, y, c), m), x, y, c);
             }
          }
       }
@@ -473,9 +440,7 @@ function applyAdaptiveScaling(img, weights, targetBg, progressCallback) {
 }
 
 function applySoftClip(img, threshold, rolloff) {
-   var w = img.width;
-   var h = img.height;
-   var nc = img.numberOfChannels;
+   var w = img.width; var h = img.height; var nc = img.numberOfChannels;
    var result = new Image(w, h, nc, nc === 3 ? ColorSpace_RGB : ColorSpace_Gray, 32, SampleType_Real);
    for (var c = 0; c < nc; c++) {
       for (var y = 0; y < h; y++) {
@@ -483,9 +448,7 @@ function applySoftClip(img, threshold, rolloff) {
             var val = img.sample(x, y, c);
             if (val > threshold) {
                var t = (val - threshold) / (1.0 - threshold);
-               t = Math.max(0, Math.min(1, t));
-               var f = 1.0 - Math.pow(1.0 - t, rolloff);
-               val = threshold + (1.0 - threshold) * f;
+               val = threshold + (1.0 - threshold) * (1.0 - Math.pow(1.0 - Math.max(0,Math.min(1,t)), rolloff));
             }
             result.setSample(Math.max(0, Math.min(1, val)), x, y, c);
          }
@@ -494,439 +457,711 @@ function applySoftClip(img, threshold, rolloff) {
    return result;
 }
 
+function composeStarImages(starmaskResult, starlessBase, useScreen) {
+    if (starmaskResult.width != starlessBase.width || starmaskResult.height != starlessBase.height) {
+        throw new Error("Dimension mismatch: Starmask and Starless image must be the same size.");
+    }
+    
+    var w = starlessBase.width; 
+    var h = starlessBase.height;
+    var result = new Image(starlessBase);
+    
+    for(var c=0; c < result.numberOfChannels; c++) {
+        for(var y=0; y < h; y++) {
+            for(var x=0; x < w; x++) {
+                var s = starmaskResult.sample(x, y, c);
+                var b = starlessBase.sample(x, y, c);
+                var val;
+                
+                if (useScreen) {
+                    val = 1.0 - (1.0 - b) * (1.0 - s);
+                } else {
+                    val = b + s;
+                }
+                result.setSample(Math.max(0, Math.min(1, val)), x, y, c);
+            }
+        }
+    }
+    return result;
+}
+
+// =============================================================================
+//  MAIN PROCESSING LOGIC
+// =============================================================================
+
+function processVeraLux(img, params, progressCallback) {
+   if (progressCallback) progressCallback("Analyzing...");
+   var w = img.width; var h = img.height; var nc = img.numberOfChannels; var isRGB = (nc === 3);
+   var weights = params.weights;
+   var logD = params.logD; var protectB = params.protectB;
+   var convergence = params.convergence;
+   var colorGrip = params.colorGrip !== undefined ? params.colorGrip : 1.0;
+   var shadowConvergence = params.shadowConvergence !== undefined ? params.shadowConvergence : 0.0;
+   var addPedestal = params.addPedestal !== false; // Default true
+   
+   var anchor = 0.0;
+   if (params.adaptive) {
+       if (progressCallback) progressCallback("Calculating Adaptive Anchor...");
+       anchor = VeraLuxCore.calculateAnchorAdaptive(img, weights);
+   } else {
+       if (progressCallback) progressCallback("Calculating Statistical Anchor...");
+       anchor = VeraLuxCore.calculateAnchorStats(img, isRGB);
+   }
+   
+   var result = new Image(w, h, nc, isRGB ? ColorSpace_RGB : ColorSpace_Gray, 32, SampleType_Real);
+   
+   if (progressCallback) progressCallback("Stretching...");
+   var epsilon = 1e-9; var lastPct = 0;
+   var D_val = Math.pow(10, logD);
+   var pedestal = 0.005;
+
+   for (var y = 0; y < h; y++) {
+      var pct = Math.round((y / h) * 100);
+      if (progressCallback && pct !== lastPct) {
+         if(pct % 5 === 0) progressCallback("Stretching: " + pct + "%");
+         lastPct = pct;
+         processEvents();
+      }
+      for (var x = 0; x < w; x++) {
+         if (isRGB) {
+            var r = Math.max(0, img.sample(x, y, 0) - anchor);
+            var g = Math.max(0, img.sample(x, y, 1) - anchor);
+            var b = Math.max(0, img.sample(x, y, 2) - anchor);
+            var L = weights[0] * r + weights[1] * g + weights[2] * b;
+            var Lsafe = L + epsilon;
+            var Lstr = VeraLuxCore.hyperbolicStretch(L, D_val, protectB, 0);
+            Lstr = Math.max(0, Math.min(1, Lstr));
+            var k = Math.pow(Lstr, convergence);
+            
+            // Vector Logic
+            var rFinal = Lstr * ((r / Lsafe) * (1.0 - k) + k);
+            var gFinal = Lstr * ((g / Lsafe) * (1.0 - k) + k);
+            var bFinal = Lstr * ((b / Lsafe) * (1.0 - k) + k);
+
+            // Hybrid Logic
+            if ((colorGrip < 1.0) || (shadowConvergence > 0.01)) {
+               var rScal = Math.max(0, Math.min(1, VeraLuxCore.hyperbolicStretch(r, D_val, protectB, 0)));
+               var gScal = Math.max(0, Math.min(1, VeraLuxCore.hyperbolicStretch(g, D_val, protectB, 0)));
+               var bScal = Math.max(0, Math.min(1, VeraLuxCore.hyperbolicStretch(b, D_val, protectB, 0)));
+               
+               var currentGrip = colorGrip;
+               if (shadowConvergence > 0.01) currentGrip = currentGrip * Math.pow(Lstr, shadowConvergence);
+               var oneMinusGrip = 1.0 - currentGrip;
+               
+               rFinal = rFinal * currentGrip + rScal * oneMinusGrip;
+               gFinal = gFinal * currentGrip + gScal * oneMinusGrip;
+               bFinal = bFinal * currentGrip + bScal * oneMinusGrip;
+            }
+            
+            if (addPedestal) {
+               result.setSample(Math.max(0, Math.min(1, rFinal * (1.0 - pedestal) + pedestal)), x, y, 0);
+               result.setSample(Math.max(0, Math.min(1, gFinal * (1.0 - pedestal) + pedestal)), x, y, 1);
+               result.setSample(Math.max(0, Math.min(1, bFinal * (1.0 - pedestal) + pedestal)), x, y, 2);
+            } else {
+               result.setSample(Math.max(0, Math.min(1, rFinal)), x, y, 0);
+               result.setSample(Math.max(0, Math.min(1, gFinal)), x, y, 1);
+               result.setSample(Math.max(0, Math.min(1, bFinal)), x, y, 2);
+            }
+         } else {
+            // Mono
+            var val = Math.max(0, img.sample(x, y, 0) - anchor);
+            var str = VeraLuxCore.hyperbolicStretch(val, D_val, protectB, 0);
+            
+            if (addPedestal) str = str * (1.0 - pedestal) + pedestal;
+            
+            result.setSample(Math.max(0, Math.min(1, str)), x, y, 0);
+         }
+      }
+   }
+   
+   if (params.processingMode === "ready_to_use") {
+      if (progressCallback) progressCallback("Adaptive Scaling...");
+      result = applyAdaptiveScaling(result, weights, params.targetBg);
+      if (progressCallback) progressCallback("Soft-clip Polish...");
+      result = applySoftClip(result, 0.98, 2.0);
+   }
+   if (progressCallback) progressCallback("Complete!");
+   return result;
+}
+
+function processStarPipeline(img, params, progressCallback) {
+    if (progressCallback) progressCallback("Star Pipeline: Init...");
+    var weights = params.weights;
+    // 1. Anchor (Must check anchor before stretch for stars)
+    var anchor = 0.0;
+    if (params.adaptive) {
+        anchor = VeraLuxCore.calculateAnchorAdaptive(img, weights);
+    }
+    
+    // Create a temporary params object that bypasses modes we don't want
+    var stretchParams = {
+        weights: weights, 
+        logD: params.logD, 
+        protectB: params.protectB,
+        convergence: params.convergence, 
+        processingMode: "scientific", // Force manual, no scaling
+        targetBg: 0, 
+        colorGrip: params.colorGrip, 
+        shadowConvergence: params.shadowConvergence, 
+        adaptive: false, // Handled manually
+        addPedestal: false // CRITICAL: Do not add background pedestal for star mask
+    };
+    
+    // Pre-subtract anchor
+    var workingImg = new Image(img);
+    workingImg.apply(anchor, ImageOp_Sub);
+    workingImg.truncate(0, 1);
+    
+    // Use the core stretcher
+    var result = processVeraLux(workingImg, stretchParams, progressCallback);
+    
+    // Surgery
+    if (params.lsr > 0) {
+        if (progressCallback) progressCallback("Surgery: LSR...");
+        result = applyLSR(result, params.lsr);
+    }
+    if (params.healing > 0) {
+        if (progressCallback) progressCallback("Surgery: Optical Healing...");
+        result = applyOpticalHealing(result, params.healing);
+    }
+    if (params.reduction > 0) {
+        if (progressCallback) progressCallback("Surgery: Reduction...");
+        result = applyStarReduction(result, params.reduction);
+    }
+    
+    // Soft Clip
+    if (progressCallback) progressCallback("Polishing...");
+    result = applySoftClip(result, 0.98, 2.0);
+    
+    return result;
+}
+
 // =============================================================================
 //  GUI
 // =============================================================================
-
-var p_sensorProfile = DEFAULT_PROFILE;
-var p_processingMode = "ready_to_use"; // Default to Ready-to-Use per v1.2.2
-var p_targetBg = 0.20;
-var p_logD = 2.00; // Reset default to 2.0
-var p_protectB = 6.0;
-var p_convergence = 3.50;
-var p_colorGrip = 1.00; // New parameter
 
 function VeraLuxDialog() {
    this.__base__ = Dialog;
    this.__base__();
    
-   var VERSION = "1.2.2 (PJSR)";
+   // --- Header ---
+   this.titleLabel = new Label(this); this.titleLabel.text = "VeraLux Suite v" + VERSION;
+   this.titleLabel.styleSheet = "font-size: 14pt; font-weight: bold; color: #4aa3df;"; this.titleLabel.textAlignment = TextAlign_Center;
    
-   var headerStyle = "font-size: 14pt; font-weight: bold; color: #4aa3df;";
-   var subHeaderStyle = "font-size: 10pt; color: #4aa3df;";
-   var infoStyle = "font-size: 9pt; color: #888; font-style: italic;";
-   var checkStyle = "color: #aaa;"; 
+   // --- Global Help Button ---
+   this.btnHelp = new PushButton(this); 
+   this.btnHelp.text = "?"; 
+   this.btnHelp.toolTip = "Print Full Operational Guide to Console";
+   this.btnHelp.onClick = function() {
+       Console.show();
+       Console.noteln("<b>VERALUX OPERATIONAL GUIDE</b>");
+       Console.noteln("--------------------------------------------------");
+       Console.noteln("<b>[1] PRE-REQUISITES</b>");
+       Console.noteln("• Input MUST be Linear (not yet stretched).");
+       Console.noteln("• Input MUST be Color Calibrated (SPCC) for correct vector weights.");
+       Console.noteln("• Denoise your data (NoiseXTerminator/DeepSNR) BEFORE stretching.");
+       Console.noteln("");
+       Console.noteln("<b>[2] STRETCH MODES</b>");
+       Console.noteln("• <b>Ready-to-Use:</b> Features the 'Unified Strategy' slider.");
+       Console.noteln("  - Center (0): Balanced Vector Stretch.");
+       Console.noteln("  - Left (<0): Clean Noise (Increases Shadow Convergence).");
+       Console.noteln("  - Right (>0): Soften Highlights (Decreases Color Grip).");
+       Console.noteln("• <b>Scientific:</b> Manual control over specific physics parameters.");
+       Console.noteln("");
+       Console.noteln("<b>[3] STAR COMPOSER</b>");
+       Console.noteln("• Decouples stars from the background stretch.");
+       Console.noteln("• Use 'Linear Add' for physical blending or 'Screen' for safe blending.");
+       Console.noteln("• 'LSR' removes galaxy cores from the star mask.");
+       Console.noteln("• <b>TIP:</b> If stars are invisible, increase 'Star Intensity (LogD)'.");
+       Console.noteln("");
+       Console.noteln("<b>[4] PARAMETERS</b>");
+       Console.noteln("• <b>Log D:</b> Stretch Intensity. Higher = Brighter.");
+       Console.noteln("• <b>Protect b:</b> Highlight Protection. Higher = Sharper stars.");
+       Console.noteln("• <b>Color Grip:</b> 1.0 = Pure Vector Color. Lower to desaturate highlights.");
+       Console.noteln("--------------------------------------------------");
+       Console.noteln("Info: info@veralux.space");
+   };
    
-	this.titleLabel = new Label(this);
-   this.titleLabel.text = "VeraLux HyperMetric Stretch v" + VERSION;
-   this.titleLabel.styleSheet = headerStyle;
-   this.titleLabel.textAlignment = TextAlign_Center;
+   this.tabBox = new TabBox(this);
    
-   this.subtitleLabel = new Label(this);
-   this.subtitleLabel.text = "Photometric Hyperbolic Stretch Engine\n" + 
-                             "Original Python Implementation by Riccardo Paterniti © 2025";
-   this.subtitleLabel.styleSheet = subHeaderStyle;
-   this.subtitleLabel.textAlignment = TextAlign_Center;
+   // --------------------------------------------------------------------------
+   // TAB 1: HYPERMETRIC STRETCH
+   // --------------------------------------------------------------------------
+   this.pageStretch = new Control(this);
+   this.pageStretch.sizer = new VerticalSizer; 
+   this.pageStretch.sizer.margin = 10; this.pageStretch.sizer.spacing = 6;
    
    this.reqLabel = new Label(this);
-   this.reqLabel.text = "Ported to PixInsight\n" + 
-                        "Requirement: Linear Data • Color Calibration (SPCC) Applied";
-   this.reqLabel.styleSheet = infoStyle;
+   this.reqLabel.text = "Input: Any LINEAR Image (Stars or Starless)";
+   this.reqLabel.styleSheet = "font-size: 9pt; color: #ffaa00; font-weight: bold;";
    this.reqLabel.textAlignment = TextAlign_Center;
 
-   this.topSizer = new HorizontalSizer;
-   this.topSizer.spacing = 8;
+   this.modeGroup = new GroupBox(this); this.modeGroup.title = "Processing Mode"; this.modeGroup.sizer = new VerticalSizer;
+   this.radReady = new RadioButton(this); 
+   this.radReady.text = "Ready-to-Use (Unified)"; 
+   this.radReady.checked = true;
+   this.radReady.toolTip = "<p><b>Ready-to-Use Mode</b><br>Produces an aesthetic, export-ready image.<br>Applies adaptive 'Star-Safe' expansion and Linked MTF.</p>";
 
-   this.modeGroup = new GroupBox(this);
-   this.modeGroup.title = "0. Processing Mode";
-   this.modeGroup.sizer = new VerticalSizer;
-   this.modeGroup.sizer.margin = 8;
-   this.modeGroup.sizer.spacing = 4;
-
-   this.radReady = new RadioButton(this);
-   this.radReady.text = "Ready-to-Use (Aesthetic)";
-   this.radReady.toolTip = "<p><b>Ready-to-Use Mode:</b><br>Produces an export-ready image with Star-Safe expansion and soft-clipping.</p>";
-
-   this.radSci = new RadioButton(this);
-   this.radSci.text = "Scientific (Preserve)";
-   this.radSci.toolTip = "<p><b>Scientific Mode:</b><br>Mathematically consistent output clipped only at physical saturation.</p>";
+   this.radSci = new RadioButton(this); 
+   this.radSci.text = "Scientific (Manual)";
+   this.radSci.toolTip = "<p><b>Scientific Mode</b><br>Full manual control over Color Grip and Shadow Convergence.<br>Clips only at physical saturation (1.0).</p>";
    
-   this.modeInfoLbl = new Label(this);
-   this.modeInfoLbl.styleSheet = checkStyle;
-   this.modeInfoLbl.useRichText = true;
+   this.lblModeInfo = new Label(this);
+   this.lblModeInfo.text = "Unified Strategy Enabled.";
+   this.lblModeInfo.styleSheet = "color: #888; font-style: italic;";
    
-   this.modeGroup.sizer.add(this.radReady);
+   this.modeGroup.sizer.add(this.radReady); 
    this.modeGroup.sizer.add(this.radSci);
-   this.modeGroup.sizer.addSpacing(6);
-   this.modeGroup.sizer.add(this.modeInfoLbl);
-   this.modeGroup.sizer.addStretch();
-
-   var dlg = this;
-   this.updateModeText = function() {
-      if (dlg.radReady.checked) {
-         p_processingMode = "ready_to_use";
-         dlg.modeInfoLbl.text = "✓ Star-Safe Expansion<br>✓ Linked MTF Stretch<br>✓ Soft-clip highlights<br>✓ Ready for export";
-      } else {
-         p_processingMode = "scientific";
-         dlg.modeInfoLbl.text = "✓ Pure IHS stretch (1.0)<br>✓ Manual tone mapping<br>✓ Lossless data<br>✓ Accurate for scientific";
-      }
-   };
-   this.radReady.onClick = this.updateModeText;
-   this.radSci.onClick = this.updateModeText;
-
-   this.sensorGroup = new GroupBox(this);
-   this.sensorGroup.title = "1. Sensor Calibration";
-   this.sensorGroup.sizer = new VerticalSizer;
-   this.sensorGroup.sizer.margin = 8;
-   this.sensorGroup.sizer.spacing = 4;
+   this.modeGroup.sizer.add(this.lblModeInfo);
 
    this.sensorCombo = new ComboBox(this);
+   this.sensorCombo.toolTip = "<p><b>Sensor Profile</b><br>Defines the Luminance coefficients (Weights) used for the stretch.<br>Choose Rec.709 for general use.</p>";
    for (var key in SENSOR_PROFILES) { this.sensorCombo.addItem(key); }
-   this.sensorCombo.toolTip = "<p>Select your sensor profile to ensure correct luminance extraction weights based on Quantum Efficiency.</p>";
    
-   this.sensorInfoLbl = new Label(this);
-   this.sensorInfoLbl.styleSheet = checkStyle;
-   this.sensorInfoLbl.wordWrapping = true;
-   this.sensorInfoLbl.useRichText = true;
+   this.sensorInfoLbl = new Label(this); this.sensorInfoLbl.wordWrapping = true;
+   this.sensorGroup = new GroupBox(this); this.sensorGroup.title = "Sensor Profile"; this.sensorGroup.sizer = new VerticalSizer;
+   this.sensorGroup.sizer.add(this.sensorCombo); this.sensorGroup.sizer.add(this.sensorInfoLbl);
 
-   this.sensorGroup.sizer.add(new Label(this));
-   this.sensorGroup.sizer.add(this.sensorCombo);
-   this.sensorGroup.sizer.addSpacing(6);
-   this.sensorGroup.sizer.add(this.sensorInfoLbl);
-   this.sensorGroup.sizer.addStretch();
+   this.rowTop = new HorizontalSizer; this.rowTop.add(this.modeGroup); this.rowTop.add(this.sensorGroup);
 
-   this.updateSensorText = function() {
-      var key = dlg.sensorCombo.itemText(dlg.sensorCombo.currentItem);
-      p_sensorProfile = key;
-      var p = SENSOR_PROFILES[key];
-      dlg.sensorInfoLbl.text = p.description + "<br>Weights: R=" + p.weights[0].toFixed(4) + ", G=" + p.weights[1].toFixed(4) + ", B=" + p.weights[2].toFixed(4) + "<br>💡 " + p.info;
-   };
-   this.sensorCombo.onItemSelected = this.updateSensorText;
-
-   this.topSizer.add(this.modeGroup, 50);
-   this.topSizer.add(this.sensorGroup, 50);
-
-   this.engineGroup = new GroupBox(this);
-   this.engineGroup.title = "2. Stretch Engine & Calibration";
-   this.engineGroup.sizer = new VerticalSizer;
-   this.engineGroup.sizer.margin = 8;
-   this.engineGroup.sizer.spacing = 6;
-
-   this.rowBg = new HorizontalSizer;
-   this.rowBg.spacing = 4;
-
-   this.ncTarget = new NumericControl(this);
-   this.ncTarget.label.text = "Target Background:";
-   this.ncTarget.label.minWidth = 120;
-   this.ncTarget.setRange(0.00, 1.00);
-   this.ncTarget.setPrecision(2);
-   this.ncTarget.slider.setRange(0, 100);
-   this.ncTarget.toolTip = "<p>The desired median background level. 0.20 is standard.</p>";
-   this.ncTarget.onValueUpdated = function(val) { p_targetBg = val; };
-
-   this.btnAuto = new PushButton(this);
-   this.btnAuto.text = "⚡ Auto-Calculate Log D";
-   this.btnAuto.backgroundColor = 0xFFAA00;
-   this.btnAuto.toolTip = "<p>Automatically calculates the optimal Stretch Factor (Log D) to reach the Target Background.</p>";
-   this.btnAuto.onClick = function() { dlg.runAutoSolver(); };
+   this.engineGroup = new GroupBox(this); this.engineGroup.title = "Stretch Engine"; this.engineGroup.sizer = new VerticalSizer;
+   this.row1 = new HorizontalSizer;
    
-   this.rowBg.add(this.ncTarget);
-   this.rowBg.add(this.btnAuto);
-
-   this.ncLogD = new NumericControl(this);
-   this.ncLogD.label.text = "Log D:";
-   this.ncLogD.label.minWidth = 120;
-   this.ncLogD.setRange(0.0, 7.0);
-   this.ncLogD.setPrecision(2);
-   this.ncLogD.slider.setRange(0, 700);
-   this.ncLogD.toolTip = "<p>Stretch Intensity. Higher values = brighter midtones.</p>";
-   this.ncLogD.onValueUpdated = function(val) { p_logD = val; };
-
-   this.ncProtect = new NumericControl(this);
-   this.ncProtect.label.text = "Protect b:";
-   this.ncProtect.label.minWidth = 120;
-   this.ncProtect.setRange(0.1, 15.0);
-   this.ncProtect.setPrecision(2);
-   this.ncProtect.slider.setRange(1, 150);
-   this.ncProtect.toolTip = "<p>Highlight Protection. Higher values prevent star bloat but darken highlights.</p>";
-   this.ncProtect.onValueUpdated = function(val) { p_protectB = val; };
-
-   this.rowD_B = new HorizontalSizer;
-   this.rowD_B.spacing = 10;
-   this.rowD_B.add(this.ncLogD, 60);
-   this.rowD_B.add(this.ncProtect, 40);
-
-   this.engineGroup.sizer.add(this.rowBg);
-   this.engineGroup.sizer.add(this.rowD_B);
-
-   this.physGroup = new GroupBox(this);
-   this.physGroup.title = "3. Physics & Convergence";
-   this.physGroup.sizer = new VerticalSizer;
-   this.physGroup.sizer.margin = 8;
+   this.chkAdaptive = new CheckBox(this); 
+   this.chkAdaptive.text = "Adaptive Anchor"; 
+   this.chkAdaptive.checked = true;
+   this.chkAdaptive.toolTip = "<p><b>Adaptive Anchor</b><br>Analyzes histogram shape to find the true signal start.<br>Recommended for max contrast.</p>";
    
-   this.ncConv = new NumericControl(this);
-   this.ncConv.label.text = "Star Core Recovery (White Point):";
-   this.ncConv.label.minWidth = 200;
-   this.ncConv.setRange(1.0, 10.0);
-   this.ncConv.setPrecision(2);
-   this.ncConv.slider.setRange(10, 100);
-   this.ncConv.toolTip = "<p>Controls how fast saturated colors transition to white. Fixes donut holes in stars.</p>";
-   this.ncConv.onValueUpdated = function(val) { p_convergence = val; };
+   this.ncTarget = new NumericControl(this); 
+   this.ncTarget.label.text = "Target Bg:"; 
+   this.ncTarget.setRange(0,1); this.ncTarget.setValue(0.20); this.ncTarget.setPrecision(2);
+   this.ncTarget.toolTip = "<p><b>Target Background</b><br>Desired median value for background sky.<br>0.20 is standard.</p>";
+   
+   this.btnAuto = new PushButton(this); 
+   this.btnAuto.text = "⚡ Auto-Calc Log D"; this.btnAuto.backgroundColor = 0xFFAA00; 
+   this.btnAuto.toolTip = "<p><b>Auto-Solver</b><br>Finds the optimal Stretch Factor (Log D) to place the background at Target Level without clipping blacks.</p>";
+   
+   this.row1.add(this.ncTarget); this.row1.add(this.chkAdaptive); this.row1.add(this.btnAuto);
+   
+   this.row2 = new HorizontalSizer;
+   this.ncLogD = new NumericControl(this); 
+   this.ncLogD.label.text = "Log D:"; this.ncLogD.setRange(0,7); this.ncLogD.setValue(2.0);
+   this.ncLogD.toolTip = "<p><b>Intensity (Log D)</b><br>Controls the strength of the stretch.<br>Higher = Brighter.</p>";
+   
+   this.ncProtect = new NumericControl(this); 
+   this.ncProtect.label.text = "Protect b:"; this.ncProtect.setRange(0.1,15); this.ncProtect.setValue(6.0);
+   this.ncProtect.toolTip = "<p><b>Highlight Protection (b)</b><br>Controls the 'knee' of the curve.<br>• <b>High (>6):</b> Sharper stars.<br>• <b>Low (<2):</b> Brighter nebula/bloat.</p>";
+   
+   this.row2.add(this.ncLogD); this.row2.add(this.ncProtect);
+   this.engineGroup.sizer.add(this.row1); this.engineGroup.sizer.add(this.row2);
 
-   this.ncGrip = new NumericControl(this);
-   this.ncGrip.label.text = "Chromatic Preservation (Color Grip):";
-   this.ncGrip.label.minWidth = 200;
-   this.ncGrip.setRange(0.0, 1.0);
-   this.ncGrip.setPrecision(2);
-   this.ncGrip.slider.setRange(0, 100);
-   this.ncGrip.toolTip = "<p><b>Color Grip:</b> Controls the rigor of Color Vector preservation.<br>" +
-                        "• <b>1.00 (Default):</b> Pure VeraLux. 100% Vector lock. Maximum vividness.<br>" +
-                        "• <b>< 1.00:</b> Blends with standard Scalar stretch. Softens star cores and relaxes saturation.</p>";
-   this.ncGrip.onValueUpdated = function(val) { p_colorGrip = val; };
-
+   this.physGroup = new GroupBox(this); this.physGroup.title = "Physics & Color"; this.physGroup.sizer = new VerticalSizer;
+   
+   this.ncConv = new NumericControl(this); 
+   this.ncConv.label.text = "Star Core:"; this.ncConv.setRange(1,10); this.ncConv.setValue(3.5);
+   this.ncConv.toolTip = "<p><b>Star Core Recovery</b><br>Controls how quickly saturated colors transition to white.</p>";
+   
    this.physGroup.sizer.add(this.ncConv);
-   this.physGroup.sizer.add(this.ncGrip);
 
-   this.progressLabel = new Label(this);
-   this.progressLabel.text = "Ready.";
-   this.progressLabel.textAlignment = TextAlign_Center;
+   this.ncUnified = new NumericControl(this); 
+   this.ncUnified.label.text = "Strategy:"; this.ncUnified.setRange(-100,100); this.ncUnified.setValue(0); this.ncUnified.setPrecision(0);
+   this.ncUnified.toolTip = "<p><b>Unified Color Strategy</b><br>• <b>Center (0):</b> Balanced.<br>• <b>Left (<0):</b> Clean Noise.<br>• <b>Right (>0):</b> Soften Highlights.</p>";
+   
+   this.lblUnified = new Label(this); this.lblUnified.text = "Balanced (Pure Vector)";
+   
+   this.sciSizer = new VerticalSizer;
+   this.ncGrip = new NumericControl(this); 
+   this.ncGrip.label.text = "Grip:"; this.ncGrip.setRange(0,1); this.ncGrip.setValue(1);
+   this.ncGrip.toolTip = "<p><b>Color Grip</b><br>Controls Vector Color preservation.<br>• <b>1.0:</b> 100% Vector lock (Vivid).<br>• <b><1.0:</b> Blends with scalar stretch (Softer).</p>";
+   
+   this.ncShadow = new NumericControl(this); 
+   this.ncShadow.label.text = "Shadow Conv:"; this.ncShadow.setRange(0,3); this.ncShadow.setValue(0);
+   this.ncShadow.toolTip = "<p><b>Shadow Convergence</b><br>Damps chromatic noise in the background.<br>Increase if background looks speckled.</p>";
+   
+   this.sciSizer.add(this.ncGrip); this.sciSizer.add(this.ncShadow);
+   this.physGroup.sizer.add(this.ncUnified); this.physGroup.sizer.add(this.lblUnified); this.physGroup.sizer.add(this.sciSizer);
 
-   this.progressBar = new Slider(this);
-   this.progressBar.setRange(0, 100);
-   this.progressBar.value = 0;
-   this.progressBar.enabled = false;
-   this.progressBar.minWidth = 300;
+   this.btnAudit = new PushButton(this); 
+   this.btnAudit.text = "Analyze Clipping";
+   this.btnAudit.toolTip = "Checks for black clipping and proposes a safe Log D.";
+   
+   this.btnProcStretch = new PushButton(this); this.btnProcStretch.text = "PROCESS STRETCH"; this.btnProcStretch.backgroundColor = 0xFF009900; this.btnProcStretch.textColor = 0xFFFFFF;
 
-   this.btnSizer = new HorizontalSizer;
-   this.btnSizer.spacing = 6;
+   this.pageStretch.sizer.add(this.reqLabel);
+   this.pageStretch.sizer.add(this.rowTop);
+   this.pageStretch.sizer.add(this.engineGroup);
+   this.pageStretch.sizer.add(this.physGroup);
+   this.pageStretch.sizer.add(this.btnAudit);
+   this.pageStretch.sizer.addStretch();
+   this.pageStretch.sizer.add(this.btnProcStretch);
 
-   this.btnInstance = new ToolButton(this);
-   this.btnInstance.icon = this.scaledResource( ":/process-interface/new-instance.png" );
-   this.btnInstance.setScaledFixedSize( 24, 24 );
-   this.btnInstance.toolTip = "New Instance (Drag to Workspace)";
-   this.btnInstance.onMousePress = function() {
-      this.hasFocus = true;
-      dlg.saveParams();
-      this.pushed = false;
-      this.dialog.newInstance();
+   // --------------------------------------------------------------------------
+   // TAB 2: STAR COMPOSER
+   // --------------------------------------------------------------------------
+   this.pageStar = new Control(this);
+   this.pageStar.sizer = new VerticalSizer;
+   this.pageStar.sizer.margin = 10; this.pageStar.sizer.spacing = 6;
+   
+   this.reqLabelStar = new Label(this);
+   this.reqLabelStar.text = "Input: Linear Starmask + Stretched Starless";
+   this.reqLabelStar.styleSheet = "font-size: 9pt; color: #ffaa00; font-weight: bold;";
+   this.reqLabelStar.textAlignment = TextAlign_Center;
+   this.pageStar.sizer.add(this.reqLabelStar);
+
+   this.grpViews = new GroupBox(this); this.grpViews.title = "Input Data"; this.grpViews.sizer = new VerticalSizer;
+   this.lblMask = new Label(this); this.lblMask.text = "Starmask (Linear):";
+   this.cmbStarMask = new ComboBox(this);
+   this.lblBase = new Label(this); this.lblBase.text = "Starless Base (Stretched):";
+   this.cmbStarBase = new ComboBox(this);
+   
+   var windows = ImageWindow.windows;
+   for (var i = 0; i < windows.length; ++i) {
+       this.cmbStarMask.addItem(windows[i].mainView.id);
+       this.cmbStarBase.addItem(windows[i].mainView.id);
+   }
+   
+   if (windows.length > 0) {
+       this.cmbStarMask.currentItem = 0;
+       this.cmbStarBase.currentItem = (windows.length > 1) ? 1 : 0; 
+   } else {
+       this.cmbStarMask.addItem("[No Images Open]");
+       this.cmbStarBase.addItem("[No Images Open]");
+       this.cmbStarMask.enabled = false;
+       this.cmbStarBase.enabled = false;
+   }
+
+   this.grpViews.sizer.add(this.lblMask); this.grpViews.sizer.add(this.cmbStarMask);
+   this.grpViews.sizer.add(this.lblBase); this.grpViews.sizer.add(this.cmbStarBase);
+   
+   this.grpModeStar = new GroupBox(this); this.grpModeStar.title = "Blend Mode"; this.grpModeStar.sizer = new HorizontalSizer;
+   this.radAdd = new RadioButton(this); 
+   this.radAdd.text = "Linear Add (Physical)"; this.radAdd.checked = true;
+   this.radAdd.toolTip = "<p><b>Linear Add</b><br>Physical light addition.<br>High contrast, but risk of core clipping.</p>";
+   
+   this.radScreen = new RadioButton(this); 
+   this.radScreen.text = "Screen (Safe)";
+   this.radScreen.toolTip = "<p><b>Screen Blend</b><br>Soft blend.<br>Preserves galaxy cores and prevents explosion.</p>";
+   
+   this.grpModeStar.sizer.add(this.radAdd); this.grpModeStar.sizer.add(this.radScreen);
+
+   this.grpStarEngine = new GroupBox(this); this.grpStarEngine.title = "Star Engine"; this.grpStarEngine.sizer = new VerticalSizer;
+   this.ncStarD = new NumericControl(this); 
+   this.ncStarD.label.text = "Star Intensity (LogD):"; this.ncStarD.setRange(0, 6); 
+   this.ncStarD.setValue(1.5); // Default high intensity for stars
+   this.ncStarD.toolTip = "<p><b>Star Intensity</b><br>Master gain control.<br>Increases brightness of star field.</p>";
+   
+   this.ncStarB = new NumericControl(this); 
+   this.ncStarB.label.text = "Hardness (b):"; this.ncStarB.setRange(0.1, 20); this.ncStarB.setValue(6.0);
+   this.ncStarB.toolTip = "<p><b>Profile Hardness</b><br>High = Sharp/Pinpoint.<br>Low = Soft/Halos.</p>";
+   
+   this.chkStarAdapt = new CheckBox(this); this.chkStarAdapt.text = "Adaptive Anchor"; this.chkStarAdapt.checked = false; // Default OFF for masks
+   this.chkStarAdapt.toolTip = "Keep OFF for StarNet/StarXTerminator masks (which are already zero-based).";
+   
+   this.btnStarAuto = new PushButton(this);
+   this.btnStarAuto.text = "⚡ Auto-Stretch Stars"; this.btnStarAuto.backgroundColor = 0xFFAA00;
+   this.btnStarAuto.toolTip = "<p><b>Auto-Star</b><br>Calculates correct intensity to make stars visible.</p>";
+   
+   this.grpStarEngine.sizer.add(this.ncStarD); 
+   this.grpStarEngine.sizer.add(this.btnStarAuto); // Added button
+   this.grpStarEngine.sizer.add(this.ncStarB); 
+   this.grpStarEngine.sizer.add(this.chkStarAdapt);
+
+   this.grpStarPhys = new GroupBox(this); this.grpStarPhys.title = "Physics & Surgery"; this.grpStarPhys.sizer = new VerticalSizer;
+   this.ncStarGrip = new NumericControl(this); this.ncStarGrip.label.text = "Color Grip:"; this.ncStarGrip.setRange(0, 1); this.ncStarGrip.setValue(1.0);
+   this.ncStarGrip.toolTip = "Controls color vibrance retention in star cores.";
+   
+   this.ncLSR = new NumericControl(this); this.ncLSR.label.text = "LSR (Rejection):"; this.ncLSR.setRange(0, 1); this.ncLSR.setValue(0.0);
+   this.ncLSR.toolTip = "<p><b>Large Structure Rejection</b><br>Removes blobs (galaxy cores/nebulosity) from the star mask.</p>";
+   
+   this.ncHeal = new NumericControl(this); this.ncHeal.label.text = "Healing (Halos):"; this.ncHeal.setRange(0, 20); this.ncHeal.setValue(0.0);
+   this.ncHeal.toolTip = "<p><b>Optical Healing</b><br>Repairs chromatic aberration (magenta/green halos).</p>";
+   
+   this.grpStarPhys.sizer.add(this.ncStarGrip); this.grpStarPhys.sizer.add(this.ncLSR); this.grpStarPhys.sizer.add(this.ncHeal);
+
+   this.btnProcStar = new PushButton(this); this.btnProcStar.text = "PROCESS STAR COMPOSITION"; this.btnProcStar.backgroundColor = 0xFF0055AA; this.btnProcStar.textColor = 0xFFFFFF;
+
+   this.pageStar.sizer.add(this.grpViews);
+   this.pageStar.sizer.add(this.grpModeStar);
+   this.pageStar.sizer.add(this.grpStarEngine);
+   this.pageStar.sizer.add(this.grpStarPhys);
+   this.pageStar.sizer.addStretch();
+   this.pageStar.sizer.add(this.btnProcStar);
+
+   // --- MAIN SIZER ---
+   this.tabBox.addPage(this.pageStretch, "HyperMetric Stretch");
+   this.tabBox.addPage(this.pageStar, "StarComposer");
+   
+   this.mainSizer = new VerticalSizer; this.mainSizer.margin = 8;
+   
+   // Title Row + Help Button
+   this.headerSizer = new HorizontalSizer;
+   this.headerSizer.addStretch();
+   this.headerSizer.add(this.titleLabel);
+   this.headerSizer.addStretch();
+   this.headerSizer.add(this.btnHelp); // "?" Button at top right
+   
+   this.mainSizer.add(this.headerSizer);
+   this.mainSizer.add(this.tabBox);
+   
+   this.sizer = this.mainSizer;
+   
+   // --- LOGIC BINDINGS ---
+   var dlg = this;
+
+   // Mode Update
+   this.updateMode = function() {
+       var ready = dlg.radReady.checked;
+       dlg.ncUnified.visible = ready; dlg.lblUnified.visible = ready; 
+       dlg.sciSizer.visible = !ready;
+       
+       if (ready) dlg.lblModeInfo.text = "Unified Strategy Enabled. (Aesthetic Focus)";
+       else dlg.lblModeInfo.text = "Scientific Mode. (Manual Parameter Control)";
+       
+       dlg.pageStretch.adjustToContents(); 
+   };
+   this.radReady.onClick = this.updateMode; this.radSci.onClick = this.updateMode;
+   
+   // Sensor Info Update
+   this.updateSensor = function() {
+       var key = dlg.sensorCombo.itemText(dlg.sensorCombo.currentItem);
+       var profile = SENSOR_PROFILES[key];
+       dlg.sensorInfoLbl.text = profile.info + "\n(Weights: " + profile.weights[0].toFixed(2) + ", " + profile.weights[1].toFixed(2) + ", " + profile.weights[2].toFixed(2) + ")";
+   };
+   this.sensorCombo.onItemSelected = this.updateSensor;
+   
+   // Unified Slider Feedback
+   this.ncUnified.onValueUpdated = function(val) {
+       if(val < 0) dlg.lblUnified.text = "Action: Noise Cleaning (ShadowConv: " + (Math.abs(val)/100 * 3).toFixed(1) + ")";
+       else if(val > 0) dlg.lblUnified.text = "Action: Soften Highlights (Grip: " + (1.0 - (val/100)*0.6).toFixed(2) + ")";
+       else dlg.lblUnified.text = "Balanced (Pure Vector)";
    };
 
-   this.btnReset = new PushButton(this);
-   this.btnReset.text = "Default Settings";
-   this.btnReset.toolTip = "Reset all parameters to default.";
-   this.btnReset.onClick = function() { dlg.resetDefaults(); };
+   // Button Actions
+   this.btnAuto.onClick = function() { dlg.runSmartSolver(); };
+   this.btnAudit.onClick = function() { dlg.runAuditAndFix(); };
+   this.btnProcStretch.onClick = function() { dlg.runStretchProcess(); };
+   this.btnProcStar.onClick = function() { dlg.runStarProcess(); };
+   this.btnStarAuto.onClick = function() { dlg.runStarSolver(); };
 
-   this.btnProcess = new PushButton(this);
-   this.btnProcess.text = "PROCESS";
-   this.btnProcess.defaultButton = true;
-   // CHANGED COLOR TO GREEN (ARGB Format: Alpha=FF, R=00, G=99, B=00)
-   this.btnProcess.backgroundColor = 0xFF009900; 
-   this.btnProcess.textColor = 0xFFFFFF;
-   this.btnProcess.toolTip = "Execute the Stretch";
+   // --- METHODS ---
    
-   this.btnProcess.onClick = function() {
-      // CHECK FOR IMAGE IMMEDIATELY
-      if (!ImageWindow.activeWindow) {
-         (new MessageBox("Please load an image first before clicking Process.", "No Active Image", StdIcon_Error, StdButton_Ok)).execute();
-         return;
-      }
-
-      dlg.btnProcess.enabled = false;
-      dlg.btnReset.enabled = false;
-      dlg.btnAuto.enabled = false;
-      dlg.saveParams();
+   this.runSmartSolver = function() {
+      if (!ImageWindow.activeWindow) return;
+      Console.show();
+      Console.noteln("VeraLux: Smart Solver started...");
       
-      var params = {
-         weights: SENSOR_PROFILES[p_sensorProfile].weights,
-         logD: p_logD,
-         protectB: p_protectB,
-         convergence: p_convergence,
-         processingMode: p_processingMode,
-         targetBg: p_targetBg,
-         colorGrip: p_colorGrip
-      };
-
-      var callback = function(msg, percent) {
-         dlg.progressLabel.text = msg;
-         dlg.progressBar.value = percent;
-      };
-
-      try {
-         var resImg = processVeraLux(ImageWindow.activeWindow.mainView.image, params, callback);
-         if (resImg) {
-            var w = new ImageWindow(resImg.width, resImg.height, resImg.numberOfChannels, 
-                                    resImg.bitsPerSample, resImg.isReal, resImg.isColor, "VeraLux_Output");
-            w.mainView.beginProcess();
-            w.mainView.image.assign(resImg);
-            w.mainView.endProcess();
-            w.show();
-            dlg.ok();
-         }
-      } catch (e) {
-         (new MessageBox("Error: " + e, "VeraLux Error", StdIcon_Error, StdButton_Ok)).execute();
-         dlg.btnProcess.enabled = true;
-         dlg.btnReset.enabled = true;
-         dlg.btnAuto.enabled = true;
-      }
-   };
-
-   this.btnClose = new PushButton(this);
-   this.btnClose.text = "Close";
-   this.btnClose.onClick = function() { dlg.cancel(); };
-
-   this.btnSizer.add(this.btnInstance);
-   this.btnSizer.addStretch();
-   this.btnSizer.add(this.btnReset);
-   this.btnSizer.add(this.btnProcess);
-   this.btnSizer.add(this.btnClose);
-
-   this.sizer = new VerticalSizer;
-   this.sizer.margin = 12;
-   this.sizer.spacing = 8;
-   this.sizer.add(this.titleLabel);
-   this.sizer.add(this.subtitleLabel);
-   this.sizer.add(this.reqLabel);
-   this.sizer.addSpacing(8);
-   this.sizer.add(this.topSizer);
-   this.sizer.add(this.engineGroup);
-   this.sizer.add(this.physGroup);
-   this.sizer.addSpacing(6);
-   this.sizer.add(this.progressBar);
-   this.sizer.add(this.progressLabel);
-   this.sizer.addSpacing(6);
-   this.sizer.add(this.btnSizer);
-
-	this.windowTitle = "VeraLux v" + VERSION;
-   
-   // Force a minimum width to prevent the window from being too small
-   this.minHeight = 800; 
-   
-   this.adjustToContents();
-   this.setFixedSize();
-
-   this.loadParams = function() {
-      if (p_processingMode === "ready_to_use") this.radReady.checked = true;
-      else this.radSci.checked = true;
-      this.updateModeText();
-
-      for(var i=0; i<this.sensorCombo.numberOfItems; i++) {
-         if(this.sensorCombo.itemText(i) == p_sensorProfile) {
-            this.sensorCombo.currentItem = i;
-            break;
-         }
-      }
-      this.updateSensorText();
-
-      this.ncTarget.setValue(p_targetBg);
-      this.ncLogD.setValue(p_logD);
-      this.ncProtect.setValue(p_protectB);
-      this.ncConv.setValue(p_convergence);
-      this.ncGrip.setValue(p_colorGrip);
-   };
-
-   this.saveParams = function() {
-      p_targetBg = this.ncTarget.value;
-      p_logD = this.ncLogD.value;
-      p_protectB = this.ncProtect.value;
-      p_convergence = this.ncConv.value;
-      p_colorGrip = this.ncGrip.value;
-      p_sensorProfile = this.sensorCombo.itemText(this.sensorCombo.currentItem);
-      p_processingMode = this.radReady.checked ? "ready_to_use" : "scientific";
-   };
-
-   this.resetDefaults = function() {
-      p_processingMode = "ready_to_use";
-      p_sensorProfile = DEFAULT_PROFILE;
-      p_targetBg = 0.20;
-      p_logD = 2.0;
-      p_protectB = 6.0;
-      p_convergence = 3.5;
-      p_colorGrip = 1.00;
-      this.loadParams();
-   };
-
-   this.runAutoSolver = function() {
-      if (!ImageWindow.activeWindow) {
-          (new MessageBox("Please load an image first for the Auto Solver.", "No Active Image", StdIcon_Error, StdButton_Ok)).execute();
-          return;
-      }
       var img = ImageWindow.activeWindow.mainView.image;
-      var weights = SENSOR_PROFILES[p_sensorProfile].weights;
-      var isRGB = img.numberOfChannels === 3;
+      var weights = SENSOR_PROFILES[dlg.sensorCombo.itemText(dlg.sensorCombo.currentItem)].weights;
+      var anchor = dlg.chkAdaptive.checked ? VeraLuxCore.calculateAnchorAdaptive(img, weights) : VeraLuxCore.calculateAnchorStats(img, img.numberOfChannels===3);
       
-      this.progressLabel.text = "Auto-Solver Running...";
-      processEvents();
-
-      var anchor = VeraLuxCore.calculateAnchor(img, isRGB);
       var samples = [];
-      // Use efficient sampling
       var step = Math.max(1, Math.floor((img.width*img.height)/100000));
       for(var i=0; i<img.width*img.height; i+=step) {
-         var x = i % img.width; var y = Math.floor(i/img.width);
-         var val = isRGB ? 
-            (weights[0]*img.sample(x,y,0) + weights[1]*img.sample(x,y,1) + weights[2]*img.sample(x,y,2)) : 
-            img.sample(x,y,0);
+         var x = i%img.width; var y = Math.floor(i/img.width);
+         var val = (img.numberOfChannels===3) ? (weights[0]*img.sample(x,y,0) + weights[1]*img.sample(x,y,1) + weights[2]*img.sample(x,y,2)) : img.sample(x,y,0);
          val = Math.max(0, val - anchor);
          if(val > 1e-7) samples.push(val);
       }
+      if(samples.length===0){dlg.ncLogD.setValue(2.0); return;}
       
+      var targetTemp = dlg.ncTarget.value;
+      var bestLogD = 2.0;
+      var bVal = dlg.ncProtect.value;
       var medianIn = VeraLuxCore.percentile(samples, 50);
-      var res = VeraLuxCore.solveLogD(medianIn, this.ncTarget.value, this.ncProtect.value);
-      this.ncLogD.setValue(res);
-      this.progressLabel.text = "Solved LogD: " + res.toFixed(2);
+
+      // Iterative Solver ("Floating Sky Check")
+      for(var iter=0; iter<15; iter++) {
+          bestLogD = VeraLuxCore.solveLogD(medianIn, targetTemp, bVal);
+          if(!dlg.radReady.checked) break; // Scientific mode no auto-fix
+          
+          var D = Math.pow(10, bestLogD);
+          var strSamples = [];
+          for(var k=0; k<samples.length; k++) strSamples.push(VeraLuxCore.hyperbolicStretch(samples[k], D, bVal));
+          var med = VeraLuxCore.percentile(strSamples, 50);
+          var mean = 0; for(var z=0; z<strSamples.length; z++) mean+=strSamples[z]; mean/=strSamples.length;
+          var std = 0; for(var z=0; z<strSamples.length; z++) std+=Math.pow(strSamples[z]-mean, 2); std=Math.sqrt(std/strSamples.length);
+          var minV = 1.0; for(var z=0; z<strSamples.length; z++) if(strSamples[z]<minV) minV=strSamples[z];
+          
+          var globalFloor = Math.max(minV, med - (2.7 * std)); // 2.7 sigma rule
+          if (globalFloor <= 0.001) break; // Safe
+          
+          targetTemp -= 0.015; if(targetTemp < 0.05) break;
+      }
+      dlg.ncLogD.setValue(bestLogD);
+      Console.noteln("VeraLux: Solver Result LogD = " + bestLogD.toFixed(2));
    };
 
-   this.loadParams();
+   this.runStarSolver = function() {
+       // Logic: Find non-zero pixels, target brightness ~0.10 (Conservative)
+       var maskId = dlg.cmbStarMask.itemText(dlg.cmbStarMask.currentItem);
+       if (!maskId || maskId.indexOf("[") >= 0) return;
+       var maskView = View.viewById(maskId);
+       var img = maskView.image;
+       
+       // Sampling
+       var samples = [];
+       var step = Math.max(1, Math.floor((img.width*img.height)/100000));
+       for(var i=0; i<img.width*img.height; i+=step) {
+           var v = img.sample(i % img.width, Math.floor(i / img.width), 0); // Check 1st channel
+           if (v > 0.0001) samples.push(v); // Grab star data
+       }
+       
+       if (samples.length === 0) {
+           (new MessageBox("Starmask appears empty or pure black.", "Solver Error")).execute();
+           return;
+       }
+       
+       var medianStar = VeraLuxCore.percentile(samples, 50);
+       var bVal = dlg.ncStarB.value;
+       var bestLogD = VeraLuxCore.solveLogD(medianStar, 0.10, bVal); // Target 0.10 brightness
+       
+       dlg.ncStarD.setValue(bestLogD);
+       (new MessageBox("Calculated Star Intensity: " + bestLogD.toFixed(2), "Star Solver")).execute();
+   };
+
+   this.runAuditAndFix = function() {
+       if (!ImageWindow.activeWindow) return;
+       Console.show();
+       Console.noteln("VeraLux: Auditing...");
+       var img = ImageWindow.activeWindow.mainView.image;
+       var weights = SENSOR_PROFILES[dlg.sensorCombo.itemText(dlg.sensorCombo.currentItem)].weights;
+       var anchor = dlg.chkAdaptive.checked ? VeraLuxCore.calculateAnchorAdaptive(img, weights) : VeraLuxCore.calculateAnchorStats(img, img.numberOfChannels===3);
+       
+       var samples = []; var step = Math.max(1, Math.floor((img.width*img.height)/100000));
+       var rawClipCount = 0;
+       for(var i=0; i<img.width*img.height; i+=step) {
+          var x = i%img.width; var y = Math.floor(i/img.width);
+          var val = (img.numberOfChannels===3) ? (weights[0]*img.sample(x,y,0) + weights[1]*img.sample(x,y,1) + weights[2]*img.sample(x,y,2)) : img.sample(x,y,0);
+          if (val < anchor) rawClipCount++;
+          samples.push(Math.max(0, val - anchor));
+       }
+       
+       var rawClipPct = (rawClipCount / samples.length) * 100;
+       var currentD = Math.pow(10, dlg.ncLogD.value);
+       var b = dlg.ncProtect.value;
+       var postClipCount = 0;
+       for(var k=0; k<samples.length; k++) {
+           if(VeraLuxCore.hyperbolicStretch(samples[k], currentD, b) <= 1e-7) postClipCount++;
+       }
+       var postClipPct = (postClipCount / samples.length) * 100;
+
+       if (rawClipPct > 0.5) { (new MessageBox("WARNING: Source Clipping (" + rawClipPct.toFixed(2) + "%).\nAnchor is cutting data.\nUncheck 'Adaptive Anchor' or Crop artifacts.", "VeraLux Audit", StdIcon_Warning, StdButton_Ok)).execute(); return; }
+       if (postClipPct < 0.1) { (new MessageBox("Analysis Result: SAFE (" + postClipPct.toFixed(2) + "% clip).\nNo action needed.", "VeraLux Audit", StdIcon_Information, StdButton_Ok)).execute(); return; }
+
+       var safeLogD = dlg.ncLogD.value;
+       for(var k=0; k<20; k++) {
+           safeLogD -= 0.05; var tD = Math.pow(10, safeLogD); var c = 0;
+           for(var z=0; z<samples.length; z++) if(VeraLuxCore.hyperbolicStretch(samples[z], tD, b) <= 1e-7) c++;
+           if( (c/samples.length)*100 < 0.1 ) break;
+       }
+
+       var msg = new MessageBox("Clipping Detected (" + postClipPct.toFixed(2) + "%).\nSuggest reducing Log D to " + safeLogD.toFixed(2) + ".\nApply?", "VeraLux Fixer", StdIcon_Warning, StdButton_Yes, StdButton_No);
+       if (msg.execute() === StdButton_Yes) { dlg.ncLogD.setValue(safeLogD); }
+   };
+
+   this.runStretchProcess = function() {
+       if (!ImageWindow.activeWindow) { (new MessageBox("Load an image.", "Error")).execute(); return; }
+       
+       // Show Console for Progress
+       Console.show();
+       Console.noteln("<b>VeraLux: Starting HyperMetric Stretch...</b>");
+       Console.flush();
+       
+       var grip = dlg.ncGrip.value; var shadow = dlg.ncShadow.value;
+       if(dlg.radReady.checked) {
+           var val = dlg.ncUnified.value;
+           if(val < 0) { shadow = (Math.abs(val)/100)*3.0; grip = 1.0; } 
+           else { grip = 1.0 - ((val/100)*0.6); shadow = 0.0; }
+       }
+       var params = {
+           weights: SENSOR_PROFILES[dlg.sensorCombo.itemText(dlg.sensorCombo.currentItem)].weights,
+           logD: dlg.ncLogD.value, protectB: dlg.ncProtect.value, convergence: dlg.ncConv.value,
+           processingMode: dlg.radReady.checked ? "ready_to_use" : "scientific",
+           targetBg: dlg.ncTarget.value, colorGrip: grip, shadowConvergence: shadow, 
+           adaptive: dlg.chkAdaptive.checked
+       };
+       
+       try {
+           var resImg = processVeraLux(ImageWindow.activeWindow.mainView.image, params, function(msg){ Console.noteln(msg); });
+           var w = new ImageWindow(resImg.width, resImg.height, resImg.numberOfChannels, 32, true, true, "VeraLux_Stretch");
+           w.mainView.beginProcess(); w.mainView.image.assign(resImg); w.mainView.endProcess(); w.show();
+           Console.noteln("<b>VeraLux: Done.</b>");
+           dlg.ok();
+       } catch(e) {
+           (new MessageBox("Error: " + e)).execute();
+       }
+   };
+
+   this.runStarProcess = function() {
+       // Check inputs
+       if (dlg.cmbStarMask.currentItem < 0 || dlg.cmbStarBase.currentItem < 0) {
+           (new MessageBox("Please select both a Starmask and a Starless Base image.", "Selection Error", StdIcon_Error, StdButton_Ok)).execute(); 
+           return;
+       }
+
+       var maskId = dlg.cmbStarMask.itemText(dlg.cmbStarMask.currentItem);
+       var baseId = dlg.cmbStarBase.itemText(dlg.cmbStarBase.currentItem);
+       
+       if (maskId == "[No Images Open]") {
+           (new MessageBox("No images are currently open in PixInsight.", "Error", StdIcon_Error, StdButton_Ok)).execute();
+           return;
+       }
+       
+       var maskView = View.viewById(maskId);
+       var baseView = View.viewById(baseId);
+       
+       if (maskView.isNull || baseView.isNull) { 
+           (new MessageBox("Could not retrieve Views. Check if images were closed.", "Error", StdIcon_Error, StdButton_Ok)).execute(); 
+           return; 
+       }
+       
+       var params = {
+           weights: SENSOR_PROFILES[dlg.sensorCombo.itemText(dlg.sensorCombo.currentItem)].weights,
+           logD: dlg.ncStarD.value, 
+           protectB: dlg.ncStarB.value, 
+           convergence: 3.5, 
+           colorGrip: dlg.ncStarGrip.value,
+           shadowConvergence: 0, 
+           lsr: dlg.ncLSR.value,
+           healing: dlg.ncHeal.value,
+           reduction: 0,
+           adaptive: dlg.chkStarAdapt.checked
+       };
+       
+       Console.show();
+       Console.noteln("<b>VeraLux: Starting StarComposer...</b>");
+       Console.noteln("Mask: " + maskId);
+       Console.noteln("Base: " + baseId);
+       Console.flush();
+       
+       try {
+           // 1. Process Starmask
+           var stars = processStarPipeline(new Image(maskView.image), params, function(msg){ Console.noteln(msg); });
+           
+           // 2. Compose
+           Console.noteln("Compositing...");
+           var base = new Image(baseView.image);
+           var final = composeStarImages(stars, base, dlg.radScreen.checked);
+           
+           var w = new ImageWindow(final.width, final.height, final.numberOfChannels, 32, true, true, "VeraLux_StarComposer");
+           w.mainView.beginProcess(); w.mainView.image.assign(final); w.mainView.endProcess(); w.show();
+           Console.noteln("<b>VeraLux: Done.</b>");
+           dlg.ok();
+       } catch(e) {
+           (new MessageBox("Error during processing: " + e, "Processing Error", StdIcon_Error, StdButton_Ok)).execute();
+       }
+   };
+
+   // Init
+   this.updateMode();
+   this.updateSensor();
+   this.adjustToContents();
 }
 VeraLuxDialog.prototype = new Dialog;
 
 function main() {
-   if (Parameters.has("mode")) {
-      p_processingMode = Parameters.getString("mode");
-      p_sensorProfile = Parameters.getString("sensor");
-      p_targetBg = Parameters.getReal("bg");
-      p_logD = Parameters.getReal("logD");
-      p_protectB = Parameters.getReal("protectB");
-      p_convergence = Parameters.getReal("conv");
-      if(Parameters.has("grip")) p_colorGrip = Parameters.getReal("grip");
-   }
-
-   if (Parameters.isViewTarget) {
-      var view = Parameters.targetView;
-      console.show();
-      console.writeln("VeraLux: Executing Instance on " + view.id);
-      
-      var params = {
-         weights: SENSOR_PROFILES[p_sensorProfile].weights,
-         logD: p_logD,
-         protectB: p_protectB,
-         convergence: p_convergence,
-         processingMode: p_processingMode,
-         targetBg: p_targetBg,
-         colorGrip: p_colorGrip
-      };
-      
-      var resImg = processVeraLux(view.image, params, function(msg){ console.writeln(msg); });
-      
-      var w = new ImageWindow(resImg.width, resImg.height, resImg.numberOfChannels, 
-                              resImg.bitsPerSample, resImg.isReal, resImg.isColor, "VeraLux_Instance");
-      w.mainView.beginProcess();
-      w.mainView.image.assign(resImg);
-      w.mainView.endProcess();
-      w.show();
-      
-   } else {
-      var dialog = new VeraLuxDialog();
-      dialog.execute();
-   }
-
-   Parameters.set("mode", p_processingMode);
-   Parameters.set("sensor", p_sensorProfile);
-   Parameters.set("bg", p_targetBg);
-   Parameters.set("logD", p_logD);
-   Parameters.set("protectB", p_protectB);
-   Parameters.set("conv", p_convergence);
-   Parameters.set("grip", p_colorGrip);
+   var dialog = new VeraLuxDialog();
+   dialog.execute();
 }
 
 main();

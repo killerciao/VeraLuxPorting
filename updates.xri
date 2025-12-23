@@ -2,24 +2,35 @@
 <xri version="1.0">
    <description>
       <p>
-         <b>VeraLux HyperMetric Stretch Repository</b><br/>
-         Physics-based photometric hyperbolic stretch engine.
+         <b>VeraLux Suite Repository</b><br/>
+         Unified photometric engine containing HyperMetric Stretch and StarComposer.
       </p>
    </description>
 
    <!-- Update Package Configuration -->
    <platform os="all" arch="noarch" version="1.8.9:1.9.9">
-      <package fileName="VeraLux-Porting-V1.2.4.zip" sha1="7a2f28d1f1f0efd34857cbca82291e55d87ce5ce" type="script" releaseDate="20251211">
-         <title>VeraLux HyperMetric Stretch v1.2.4</title>
+      <package fileName="VeraLux-Suite-v2.0.7.zip" sha1="84D5ABD0FA617B83724B1E0DAEDB13CBCEC9C93C" type="script" releaseDate="20251223">
+         <title>VeraLux Suite v2.0.7</title>
+         <title>VeraLux Suite v2.0.7</title>
          <description>
             <p>
-               <b>Fixed Installation Path:</b><br/>
-               Script now installs correctly to /src/scripts/VeraLux/<br/>
+               <b>Major Release: Suite Unification</b><br/>
+               Merged HyperMetric Stretch and StarComposer into a single, tabbed interface.<br/>
                <br/>
-               <b>V1.2.2 Features:</b><br/>
-               • Restored GPL-3.0 License and Attribution.<br/>
-               • Added Hybrid Color Grip engine.<br/>
-               • Fixed Adaptive Scaling logic.
+               <b>Module 1: HyperMetric Stretch (v2.0 Engine)</b><br/>
+               • <b>Smart Iterative Solver:</b> New "Floating Sky Check" simulates post-stretch scaling to prevent black clipping automatically.<br/>
+               • <b>Unified Strategy:</b> New single slider to balance Noise Cleaning vs Highlight Softening (Ready-to-Use mode).<br/>
+               <br/>
+               <b>Module 2: StarComposer (New)</b><br/>
+               • Full PJSR port of the Star Reconstruction engine.<br/>
+               • Includes Native LSR, Optical Healing, and Reduction (No external deps).<br/>
+               • Added "Auto-Stretch Stars" solver specifically tuned for linear masks.<br/>
+               <br/>
+               <b>Critical Fixes (v2.0.7):</b><br/>
+               • <b>Math Engine:</b> Fixed coordinate out-of-range errors in composition loops.<br/>
+               • <b>Composition:</b> Disabled safety pedestal during star composition to prevent gray backgrounds.<br/>
+               • <b>Safety:</b> Adjusted default intensities to prevent star core saturation/burning.<br/>
+               • <b>PJSR:</b> Fixed missing header includes and replaced ProgressDialog with Console logging.
             </p>
          </description>
       </package>
